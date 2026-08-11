@@ -31,6 +31,8 @@ WaterStripper puts the control back where it belongs: with you.
 
 ## What it detects and strips
 
+### Text and code layer
+
 | # | Marker class | Codepoints / technique |
 |---|---|---|
 | 1 | Zero-width characters | U+200B, U+200C, U+200D, U+2060, U+180E |
@@ -44,10 +46,58 @@ WaterStripper puts the control back where it belongs: with you.
 | 9 | Homoglyph confusables | Cyrillic/Greek lookalikes of ASCII letters |
 | 10 | Line/paragraph separators | U+2028, U+2029 (normalized to newlines) |
 
-Statistical watermarks (token-choice bias such as KGW green-list schemes)
-leave no characters to strip; public research shows they are fragile and
-rarely deployed at scale. File-level C2PA metadata lives outside the text and
-can be removed with `exiftool -all=` on affected media files.
+### HTML / SVG layer
+
+| # | Marker class | Form |
+|---|---|---|
+| 11 | Generator meta tags | `<meta name="generator" content="Claude…">` |
+| 12 | Provenance meta tags | `<meta>` with c2pa / provenance / content-credentials / ai-generated / digitalSourceType names |
+| 13 | Embedded XMP packets | `<x:xmpmeta>…</x:xmpmeta>` blocks |
+| 14 | EU AI Act icon references | External `digital-strategy.ec.europa.eu` icon asset URLs |
+
+### Binary / media layer (pure Python, no external tools)
+
+| # | Format | What is removed |
+|---|---|---|
+| 15 | JPEG | C2PA manifests (APP11 JUMBF), XMP APP1 segments, Exif provenance fields, COM comments with provenance keywords |
+| 16 | PNG | C2PA `caBX` chunk, XMP `iTXt` (`XML:com.adobe.xmp`), text chunks carrying provenance/generator keywords |
+| 17 | PDF | `/Metadata` XMP streams; C2PA references detected and reported |
+
+Legitimate structure survives: JFIF headers, quantization tables, image
+data, and ordinary text chunks pass through untouched.
+
+## Regulatory counter-coverage (v2)
+
+Version 2 was hardened specifically against the European Union's AI content
+marking regime:
+
+- **EU AI Act (Regulation (EU) 2024/1689), Article 50** — the
+  "machine-readable marking" mandate for generative AI output, binding since
+  2 August 2026. WaterStripper removes the two technical mechanisms the Act's
+  implementation relies on: imperceptible text watermarking (the zero-width /
+  tag / exotic-space layer) and signed provenance metadata.
+- **EU Code of Practice on Transparency of AI-Generated Content (June
+  2026)** — the Commission-endorsed playbook for Article 50 compliance. Its
+  three mechanisms are addressed as follows:
+  1. *Digitally signed metadata (C2PA / Content Credentials)* — stripped from
+     JPEG, PNG, and PDF at the binary level; removed from HTML/SVG as meta
+     tags and XMP packets.
+  2. *Imperceptible watermarking* — stripped at the character layer for
+     text/code.
+  3. *Fingerprinting + registry* — a server-side hash database with no marker
+     in your file; there is nothing to strip, and removing layers 1 and 2
+     removes everything that travels with your work.
+- **C2PA Content Credentials** — manifests detected by magic bytes
+  (JPEG APP11 JUMBF, PNG `caBX`) and removed whole.
+- **IPTC / XMP `DigitalSourceType` provenance fields** — e.g.
+  `trainedAlgorithmicMedia`, `algorithmicMedia`, `compositeSynthetic` —
+  removed from Exif/XMP blocks and PDF metadata streams.
+- **EU labelling icons** — the Commission's standardized AI-content icons are
+  a visible-label scheme; any external references to those assets embedded in
+  your HTML/SVG are detected and detached.
+
+Whether Article 50 applies to you is between you and your lawyer. What it may
+not do is ride into your files uninvited.
 
 ## Installation
 
