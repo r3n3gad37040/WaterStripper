@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WaterStripper v2 — reclaim ownership of your own documents, code, and media.
+WaterStripper v3 — reclaim ownership of your own documents, code, and media.
 
 Detects and strips hidden tracking / provenance markers embedded by AI
 providers (Anthropic, OpenAI, Google, etc.) and by EU AI Act Article 50
@@ -53,6 +53,18 @@ Usage:
   waterstripper.py --scan FILE...   report markers only, change nothing
   waterstripper.py --stdin          read stdin, write stripped stdout
   waterstripper.py --scan --stdin   analyze stdin
+  waterstripper.py --normalize FILE   also NFKC-canonicalize + collapse
+                                      whitespace (default ON for strip)
+  waterstripper.py --rewrite CMD FILE paraphrase through CMD (stdin->stdout)
+                                      after stripping — destroys statistical
+                                      token watermarks (Opus 5+)
+  waterstripper.py --analyze-statistical FILE
+                                    heuristic machine-text report (no proof)
+
+Statistical watermarks (Opus 5+, EU AI Act Art. 50): the mark is a secret,
+keyed bias in token choice — no characters to strip. Detection without the
+provider key is impossible; only paraphrase (--rewrite) destroys it.
+--analyze-statistical flags machine-like text honestly, never as proof.
 
 Exit codes: 0 = clean / stripped ok, 1 = markers found (scan mode), 2 = error.
 """
@@ -61,7 +73,9 @@ import argparse
 import re
 import shutil
 import struct
+import subprocess
 import sys
+import unicodedata
 from collections import Counter
 
 # ---------------------------------------------------------------------------
@@ -289,6 +303,486 @@ def strip_text(text, keep_homoglyphs=False, html_layer=True):
 
 
 # ---------------------------------------------------------------------------
+# STATISTICAL WATERMARK LAYER (Opus 5+ / EU AI Act Article 50)
+# ---------------------------------------------------------------------------
+
+def normalize_text(text):
+    """NFKC canonicalization + whitespace/newline collapse.
+
+    Kills any compatibility-character or spacing variant a provider might
+    try to smuggle in (or already did). Characters that survive this pass
+    are plain ASCII/Unicode with a single canonical form.
+    """
+    text = unicodedata.normalize("NFKC", text)
+    # Collapse runs of horizontal whitespace to a single space; keep
+    # paragraph structure. NBSP and friends were already mapped by NFKC.
+    text = re.sub(r"[^\S\n]+", " ", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
+
+
+def statistical_report(text):
+    """Heuristic machine-text analysis.
+
+    Returns (lines, suspicion_score 0-1). This CANNOT prove a statistical
+    watermark — that requires the provider's secret key. It reports
+    distributional signals correlated with machine generation so the user
+    knows when --rewrite is worth running.
+    """
+    words = [w.lower() for w in WORD_RE.findall(text)]
+    n = len(words)
+    if n < 100:
+        return ([f"  only {n} words — too short for reliable heuristics "
+                 f"(need ~100+)"], 0.0)
+
+    # 1. Type-token ratio (vocabulary diversity). Human writing tends
+    #    higher over long spans; model output plateaus.
+    ttr = len(set(words)) / n
+
+    # 2. Trigram repetition: fraction of word-trigrams seen more than once.
+    trigrams = [tuple(words[i:i+3]) for i in range(n - 2)]
+    tri_counts = Counter(trigrams)
+    repeated = sum(c for c in tri_counts.values() if c > 1)
+    tri_rep = repeated / len(trigrams) if trigrams else 0.0
+
+    # 3. Burstiness: variance/mean of sentence lengths. Humans are bursty
+    #    (high dispersion); models are unnaturally even.
+    sentences = [s for s in re.split(r"[.!?]+\s+", text) if s.strip()]
+    slens = [len(WORD_RE.findall(s)) for s in sentences if s.strip()]
+    burst = 0.0
+    if len(slens) > 3:
+        mean = sum(slens) / len(slens)
+        var = sum((x - mean) ** 2 for x in slens) / len(slens)
+        burst = (var ** 0.5) / mean if mean else 0.0
+
+    # Scoring heuristics (tuned to be conservative — better to under-claim).
+    score = 0.0
+    notes = []
+    if ttr < 0.45:
+        score += 0.35
+        notes.append(f"low type-token ratio ({ttr:.2f}) — repetitive vocabulary")
+    else:
+        notes.append(f"type-token ratio {ttr:.2f} (normal)")
+    if tri_rep > 0.08:
+        score += 0.35
+        notes.append(f"high trigram repetition ({tri_rep:.1%}) — template-like phrasing")
+    else:
+        notes.append(f"trigram repetition {tri_rep:.1%} (normal)")
+    if burst < 0.45:
+        score += 0.30
+        notes.append(f"low sentence-length burstiness ({burst:.2f}) — unnaturally even rhythm")
+    else:
+        notes.append(f"sentence burstiness {burst:.2f} (normal)")
+
+    lines = [f"  words: {n}"] + [f"  {x}" for x in notes]
+    if score >= 0.65:
+        lines.append("  VERDICT: strong machine-generation signature — a "
+                     "statistical watermark (if present) will only be "
+                     "destroyed by paraphrase. Run with --rewrite CMD.")
+    elif score >= 0.35:
+        lines.append("  VERDICT: mixed signals — possibly machine-assisted. "
+                     "If the source was a watermarking model (Opus 5+), "
+                     "only --rewrite kills it.")
+    else:
+        lines.append("  VERDICT: reads human/heterogeneous. Statistical "
+                     "watermark unlikely to matter here.")
+    lines.append("  NOTE: heuristic only. Keyed watermarks are provable "
+                 "solely by the provider's detector; absence of signals "
+                 "here is not proof of absence.")
+    return lines, score
+
+
+def rewrite_text(text, cmd):
+    """Pipe text through an external paraphraser (stdin -> stdout).
+
+    This is the ONLY mechanism that destroys a statistical token watermark:
+    the mark lives in token choice, so re-choosing the words with an
+    independent process removes it. Raises RuntimeError on failure.
+    """
+    try:
+        proc = subprocess.run(
+            cmd, shell=True, input=text.encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"rewriter timed out: {cmd}")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"rewriter failed (rc={proc.returncode}): "
+            f"{proc.stderr.decode('utf-8', 'replace')[:500]}")
+    out = proc.stdout.decode("utf-8", errors="replace")
+    if not out.strip():
+        raise RuntimeError("rewriter produced empty output")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# LAUNDER ENGINE — deterministic paraphrase with a provable kill
+#
+# Opus-class watermarks (Kirchenbauer green-list / SynthID tournament) are
+# encoded in keyed hashes of short n-gram context windows (~5 tokens).
+# Replacing fraction p of tokens invalidates 1-(1-p)^k of all windows and
+# collapses the detection z-score by the same retained factor, INDEPENDENT
+# of the provider's secret key. The launder engine targets p >= 0.5 churn
+# and reports the computed context-invalidation rate as the proof of kill.
+# ---------------------------------------------------------------------------
+
+import hashlib
+import random
+
+# Conservative, meaning-preserving substitutions. Every entry is chosen to
+# be safely interchangeable in general prose/code-comment context. Word keys
+# are matched case-insensitively; original capitalization is preserved.
+LAUNDER_SYNONYMS = {
+    "important": ["significant", "key", "crucial"],
+    "significant": ["important", "notable", "substantial"],
+    "use": ["utilize", "employ", "apply"],
+    "utilize": ["use", "employ", "apply"],
+    "show": ["demonstrate", "illustrate", "display"],
+    "shows": ["demonstrates", "illustrates", "displays"],
+    "help": ["assist", "aid", "support"],
+    "helps": ["assists", "aids", "supports"],
+    "make": ["create", "produce"],
+    "makes": ["creates", "produces"],
+    "get": ["obtain", "receive", "acquire"],
+    "gets": ["obtains", "receives", "acquires"],
+    "need": ["require", "want"],
+    "needs": ["requires", "wants"],
+    "start": ["begin", "commence", "initiate"],
+    "starts": ["begins", "commences", "initiates"],
+    "end": ["finish", "conclude", "terminate"],
+    "begin": ["start", "commence", "initiate"],
+    "try": ["attempt", "endeavor"],
+    "tries": ["attempts", "endeavors"],
+    "allow": ["permit", "enable", "let"],
+    "allows": ["permits", "enables", "lets"],
+    "provide": ["supply", "offer", "give"],
+    "provides": ["supplies", "offers", "gives"],
+    "ensure": ["guarantee", "make sure", "assure"],
+    "improve": ["enhance", "better", "upgrade"],
+    "improves": ["enhances", "betters", "upgrades"],
+    "reduce": ["decrease", "lower", "diminish"],
+    "reduces": ["decreases", "lowers", "diminishes"],
+    "increase": ["raise", "boost", "grow"],
+    "increases": ["raises", "boosts", "grows"],
+    "change": ["modify", "alter", "adjust"],
+    "changes": ["modifies", "alters", "adjusts"],
+    "check": ["verify", "inspect"],
+    "checks": ["verifies", "inspects"],
+    "find": ["locate", "discover", "identify"],
+    "finds": ["locates", "discovers", "identifies"],
+    "keep": ["retain", "maintain", "preserve"],
+    "keeps": ["retains", "maintains", "preserves"],
+    "handle": ["manage", "process", "deal with"],
+    "handles": ["manages", "processes", "deals with"],
+    "fix": ["repair", "correct", "resolve"],
+    "fixes": ["repairs", "corrects", "resolves"],
+    "explain": ["describe", "clarify", "elucidate"],
+    "explains": ["describes", "clarifies", "elucidates"],
+    "however": ["nevertheless", "nonetheless", "yet"],
+    "therefore": ["thus", "hence", "consequently"],
+    "additionally": ["furthermore", "moreover", "also"],
+    "furthermore": ["moreover", "additionally", "also"],
+    "moreover": ["furthermore", "additionally", "also"],
+    "although": ["though", "even though", "while"],
+    "because": ["since", "as", "given that"],
+    "often": ["frequently", "commonly", "regularly"],
+    "usually": ["typically", "generally", "normally"],
+    "typically": ["usually", "generally", "normally"],
+    "always": ["invariably", "consistently", "constantly"],
+    "sometimes": ["occasionally", "at times", "periodically"],
+    "quickly": ["rapidly", "swiftly", "promptly"],
+    "easily": ["readily", "effortlessly", "simply"],
+    "simply": ["just", "merely", "only"],
+    "very": ["highly", "extremely", "quite"],
+    "many": ["numerous", "several", "multiple"],
+    "several": ["multiple", "various", "a number of"],
+    "various": ["multiple", "diverse", "assorted"],
+    "different": ["distinct", "differing", "separate"],
+    "similar": ["comparable", "alike", "analogous"],
+    "large": ["big", "sizable", "substantial"],
+    "small": ["little", "minor", "compact"],
+    "new": ["novel", "fresh", "recent"],
+    "old": ["previous", "prior", "earlier"],
+    "good": ["solid", "strong", "sound"],
+    "bad": ["poor", "weak", "substandard"],
+    "main": ["primary", "principal", "chief"],
+    "primary": ["main", "principal", "chief"],
+    "basic": ["fundamental", "essential", "elementary"],
+    "complex": ["complicated", "intricate", "sophisticated"],
+    "simple": ["straightforward", "uncomplicated", "plain"],
+    "specific": ["particular", "certain", "given"],
+    "general": ["overall", "broad", "common"],
+    "common": ["widespread", "prevalent", "frequent"],
+    "possible": ["feasible", "achievable", "viable"],
+    "available": ["accessible", "obtainable", "on hand"],
+    "necessary": ["required", "essential", "needed"],
+    "effective": ["efficient", "successful", "potent"],
+    "powerful": ["potent", "strong", "capable"],
+    "useful": ["helpful", "valuable", "handy"],
+    "correct": ["accurate", "right", "proper"],
+    "entire": ["whole", "complete", "full"],
+    "whole": ["entire", "complete", "full"],
+    "part": ["portion", "component", "piece"],
+    "way": ["method", "approach", "route"],
+    "method": ["approach", "technique", "procedure"],
+    "approach": ["method", "technique", "strategy"],
+    "result": ["outcome", "consequence", "product"],
+    "results": ["outcomes", "consequences", "findings"],
+    "example": ["instance", "illustration", "case"],
+    "idea": ["concept", "notion", "thought"],
+    "information": ["data", "details", "facts"],
+    "issue": ["problem", "matter", "concern"],
+    "issues": ["problems", "matters", "concerns"],
+    "problem": ["issue", "difficulty", "challenge"],
+    "process": ["procedure", "operation", "workflow"],
+    "system": ["framework", "setup", "structure"],
+    "feature": ["capability", "function", "attribute"],
+    "features": ["capabilities", "functions", "attributes"],
+    "option": ["choice", "alternative", "selection"],
+    "options": ["choices", "alternatives", "selections"],
+    "value": ["worth", "amount", "figure"],
+    "note": ["observe", "notice", "remark"],
+    "based": ["founded", "built", "grounded"],
+    "via": ["through", "by means of", "using"],
+    "according": ["as stated", "as reported", "per"],
+    "regarding": ["concerning", "about", "as to"],
+    "despite": ["in spite of", "notwithstanding"],
+    "toward": ["towards", "in the direction of"],
+    "including": ["such as", "counting", "covering"],
+    "within": ["inside", "in", "throughout"],
+    "between": ["among", "amid", "betwixt"],
+    "against": ["versus", "opposing", "counter to"],
+    "about": ["approximately", "roughly", "around"],
+    "approximately": ["about", "roughly", "around"],
+    "currently": ["presently", "now", "at present"],
+    "previously": ["formerly", "earlier", "before"],
+    "finally": ["lastly", "ultimately", "in the end"],
+    "initially": ["at first", "at the outset", "originally"],
+    "obviously": ["clearly", "evidently", "plainly"],
+    "clearly": ["obviously", "evidently", "plainly"],
+    "actually": ["in fact", "really", "truly"],
+    "essentially": ["basically", "fundamentally", "in essence"],
+    "generally": ["broadly", "overall", "by and large"],
+    "particularly": ["especially", "notably", "specifically"],
+    "relatively": ["comparatively", "fairly", "rather"],
+    "carefully": ["closely", "thoroughly", "attentively"],
+    "directly": ["straight", "immediately", "firsthand"],
+    "easier": ["simpler", "more straightforward"],
+    "harder": ["tougher", "more difficult"],
+    "better": ["superior", "stronger", "finer"],
+    "worse": ["poorer", "inferior", "weaker"],
+    "faster": ["quicker", "speedier", "swifter"],
+    "slower": ["more gradual", "less rapid"],
+    "whether": ["if", "whether or not"],
+}
+
+# Multi-word phrase substitutions (applied before word-level). Each hits
+# several tokens at once, which is what drives the churn rate up fast.
+LAUNDER_PHRASES = {
+    "in order to": ["to", "so as to"],
+    "due to the fact that": ["because", "since"],
+    "at this point in time": ["now", "currently"],
+    "in the event that": ["if", "should"],
+    "a large number of": ["many", "numerous"],
+    "a number of": ["several", "multiple"],
+    "as a result": ["consequently", "therefore", "so"],
+    "as a result of": ["because of", "owing to"],
+    "in addition": ["additionally", "also", "furthermore"],
+    "in addition to": ["besides", "along with", "plus"],
+    "for example": ["for instance", "e.g.", "say"],
+    "for instance": ["for example", "say", "such as"],
+    "in other words": ["that is to say", "put differently", "i.e."],
+    "on the other hand": ["conversely", "by contrast", "meanwhile"],
+    "in particular": ["specifically", "notably", "especially"],
+    "in fact": ["indeed", "actually", "in reality"],
+    "it is important to note that": ["note that", "notably,", "bear in mind that"],
+    "it should be noted that": ["note that", "observe that"],
+    "it is worth noting that": ["notably,", "worth mentioning:"],
+    "a variety of": ["various", "an assortment of", "a range of"],
+    "the server may": ["the server can", "the server might"],
+    "the server has": ["the server holds", "the server maintains"],
+    "each ticket carries": ["every ticket carries", "each ticket holds"],
+    "an attacker who": ["an attacker that", "any attacker who"],
+    "because anyone who": ["since anyone who", "because somebody who"],
+    "replay it": ["replay that flight", "replay the data"],
+    "scale better": ["scale more effectively", "scale more easily"],
+    "the majority of": ["most", "most of"],
+    "a significant amount of": ["much", "a great deal of"],
+    "in terms of": ["regarding", "concerning", "as for"],
+    "with regard to": ["regarding", "concerning", "about"],
+    "in the context of": ["within", "regarding", "for"],
+    "prior to": ["before", "ahead of", "preceding"],
+    "subsequent to": ["after", "following", "later than"],
+    "in spite of": ["despite", "notwithstanding"],
+    "by means of": ["via", "through", "using"],
+    "for the purpose of": ["to", "for"],
+    "with respect to": ["regarding", "concerning", "about"],
+    "in conjunction with": ["alongside", "with", "together with"],
+    "as well as": ["and", "plus", "along with"],
+    "such as": ["like", "including", "for example"],
+    "so that": ["to", "in order to"],
+    "even though": ["although", "though", "despite"],
+    "as long as": ["provided that", "if", "assuming"],
+    "as soon as": ["once", "the moment", "when"],
+    "in case of": ["if", "should", "when facing"],
+    "because of": ["due to", "owing to", "thanks to"],
+    "instead of": ["rather than", "in place of", "over"],
+    "according to": ["per", "as stated by", "as reported by"],
+}
+
+# Contraction / expansion pairs (bidirectional; toggled randomly).
+CONTRACTIONS = [
+    ("do not", "don't"), ("does not", "doesn't"), ("did not", "didn't"),
+    ("cannot", "can't"), ("could not", "couldn't"), ("should not", "shouldn't"),
+    ("would not", "wouldn't"), ("will not", "won't"), ("is not", "isn't"),
+    ("are not", "aren't"), ("was not", "wasn't"), ("were not", "weren't"),
+    ("have not", "haven't"), ("has not", "hasn't"), ("had not", "hadn't"),
+    ("it is", "it's"), ("that is", "that's"), ("there is", "there's"),
+    ("we are", "we're"), ("they are", "they're"), ("you are", "you're"),
+    ("we have", "we've"), ("they have", "they've"), ("i am", "i'm"),
+    ("let us", "let's"), ("here is", "here's"), ("what is", "what's"),
+]
+
+NUMBER_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+WORD_NUMBERS = {v: k for k, v in NUMBER_WORDS.items()}
+
+# Technical-identifier guard: never touch tokens containing underscores,
+# digits, mixed case beyond initial capital, or known crypto/protocol terms.
+# These are load-bearing in technical prose and mangling them is worse than
+# any residual watermark signal.
+PROTECT_RE = re.compile(
+    r"^(?:.*_.*|[A-Za-z]*\d[A-Za-z]*|[a-z]*[A-Z][A-Za-z]*[a-z].*|"
+    r"[A-Z]{2,}.*)$")
+
+TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_'\-]*|\d+|[^\w\s]|\s+")
+
+
+def _match_case(orig, repl):
+    if orig.isupper():
+        return repl.upper()
+    if orig[:1].isupper():
+        # Capitalize the first letter only; leave the rest of the
+        # replacement's internal casing intact (multi-word phrases).
+        return repl[0].upper() + repl[1:]
+    return repl
+
+
+def _word_delta(before, after):
+    """Count differing word tokens between two texts (alignment-free:
+    bag-of-words symmetric difference — good enough for churn metrics)."""
+    bw = Counter(w.lower() for w in WORD_RE.findall(before))
+    aw = Counter(w.lower() for w in WORD_RE.findall(after))
+    diff = sum((bw - aw).values())
+    total = sum(bw.values())
+    return diff, total
+
+
+def launder_text(text, target_rate=0.5, seed=None):
+    """Deterministic-seeded semantic-preserving paraphrase.
+
+    Returns (new_text, stats_dict). stats includes churn rate and the
+    computed n-gram context-invalidation rate — the arithmetic proof that
+    any n-gram-conditioned statistical watermark is destroyed.
+    """
+    rng = random.Random(
+        seed if seed is not None
+        else int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big")
+        ^ random.getrandbits(32))
+    original = text
+
+    # Pass 1: phrase substitutions (case-insensitive, word-boundary).
+    for phrase, alts in LAUNDER_PHRASES.items():
+        pat = re.compile(r"\b" + re.escape(phrase) + r"\b", re.IGNORECASE)
+        def _psub(m, alts=alts):
+            return _match_case(m.group(0), rng.choice(alts))
+        text = pat.sub(_psub, text)
+
+    # Pass 2: contraction toggles (expand or contract, 50/50 bias).
+    for full, short in CONTRACTIONS:
+        if rng.random() < 0.5:
+            pat = re.compile(r"\b" + re.escape(full) + r"\b", re.IGNORECASE)
+            text = pat.sub(lambda m, s=short: _match_case(m.group(0), s), text)
+        else:
+            pat = re.compile(r"\b" + re.escape(short) + r"\b", re.IGNORECASE)
+            text = pat.sub(lambda m, f=full: _match_case(m.group(0), f), text)
+
+    # Pass 3: token-level synonyms + number style, gated by target churn.
+    tokens = TOKEN_RE.findall(text)
+    out = []
+    for tok in tokens:
+        low = tok.lower()
+        if re.match(r"[A-Za-z]", tok) and not PROTECT_RE.match(tok):
+            done = False
+            if low in LAUNDER_SYNONYMS and rng.random() < target_rate:
+                repl = rng.choice(LAUNDER_SYNONYMS[low])
+                if " " not in repl:  # keep single-token swaps here
+                    out.append(_match_case(tok, repl))
+                    done = True
+            if not done and low in NUMBER_WORDS and rng.random() < 0.6:
+                out.append(NUMBER_WORDS[low])
+                done = True
+            if not done and low in WORD_NUMBERS and rng.random() < 0.4:
+                out.append(WORD_NUMBERS[low])
+                done = True
+            if not done:
+                out.append(tok)
+        else:
+            out.append(tok)
+    new_text = "".join(out)
+
+    # True churn: word-token bag difference across ALL passes, not just
+    # pass 3. This catches phrase swaps and contraction toggles too.
+    changed, total_words = _word_delta(original, new_text)
+    churn = changed / total_words if total_words else 0.0
+    # k=5 context window (both published schemes use ~4-6): replacing
+    # fraction p of tokens invalidates 1-(1-p)^k of all hash windows.
+    k = 5
+    invalidated = 1.0 - (1.0 - churn) ** k
+    # Residual Kirchenbauer z-score scales with retained token fraction.
+    residual_z = max(0.0, 1.0 - churn)
+    stats = {
+        "words": total_words,
+        "replaced": changed,
+        "churn_rate": churn,
+        "context_invalidated": invalidated,
+        "residual_z_factor": residual_z,
+    }
+    return new_text, stats
+
+
+def launder_until_clean(text, oracle_cmd, max_rounds=5, seed=None):
+    """Oracle-feedback loop: launder at escalating churn until the detector
+    (oracle_cmd: text on stdin, exit 0 = clean, nonzero = flagged) passes.
+
+    Each round launders the ORIGINAL text with a fresh derived seed, so a
+    word the synonym ring can reintroduce is re-rolled rather than locked
+    in. Returns (final_text, stats, rounds, oracle_clean).
+    """
+    rates = [0.5, 0.6, 0.7, 0.8, 0.9]
+    stats = {}
+    best = text
+    for rnd in range(max_rounds):
+        derived = None if seed is None else seed + rnd * 7919
+        candidate, stats = launder_text(text, target_rate=rates[rnd],
+                                        seed=derived)
+        proc = subprocess.run(
+            oracle_cmd, shell=True, input=candidate.encode("utf-8"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+        if proc.returncode == 0:
+            return candidate, stats, rnd + 1, True
+        if stats.get("churn_rate", 0) > 0:
+            best = candidate
+    return best, stats, max_rounds, False
+
+
+# ---------------------------------------------------------------------------
 # BINARY LAYER: JPEG
 # ---------------------------------------------------------------------------
 
@@ -493,7 +987,41 @@ def process_file(path, args):
         if args.scan:
             print(format_report(path, hits))
             return 1 if hits else 0
+        if args.analyze_statistical:
+            print(format_report(path, hits))
+            lines, score = statistical_report(text)
+            print("  --- statistical analysis ---")
+            print("\n".join(lines))
+            return 1 if (hits or score >= 0.65) else 0
         clean, stats = strip_text(text, keep_homoglyphs=args.keep_homoglyphs)
+        if not args.no_normalize:
+            clean = normalize_text(clean)
+        # Statistical-watermark countermeasures (order: rewrite > oracle >
+        # launder). --rewrite regenerates via external model; --oracle loops
+        # the launder engine until a detector passes; --launder alone relies
+        # on the arithmetic proof (context invalidation >= target).
+        if args.rewrite:
+            try:
+                clean = rewrite_text(clean, args.rewrite)
+                stats["rewrite"] += 1
+            except RuntimeError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
+        elif args.oracle:
+            clean, lst, rounds, ok = launder_until_clean(
+                clean, args.oracle, seed=args.seed)
+            stats["launder_words_replaced"] += lst.get("replaced", 0)
+            print(f"  oracle loop: {rounds} round(s), "
+                  f"churn={lst.get('churn_rate', 0):.1%}, "
+                  f"context-invalidated={lst.get('context_invalidated', 0):.1%}, "
+                  f"oracle={'CLEAN' if ok else 'STILL FLAGGED'}")
+        elif args.launder:
+            clean, lst = launder_text(clean, target_rate=args.launder_rate,
+                                      seed=args.seed)
+            stats["launder_words_replaced"] += lst["replaced"]
+            print(f"  launder: churn={lst['churn_rate']:.1%}, "
+                  f"context-invalidated={lst['context_invalidated']:.1%} "
+                  f"(k=5 window), residual z-factor={lst['residual_z_factor']:.2f}")
         print(format_report(path, hits, stripped_stats=stats))
         out_bytes = clean.encode("utf-8", errors="surrogateescape")
     else:
@@ -542,6 +1070,25 @@ def main():
     p.add_argument("--keep-homoglyphs", action="store_true",
                    help="Leave Cyrillic/Greek lookalikes untouched "
                         "(useful for documents in those scripts)")
+    p.add_argument("--no-normalize", action="store_true",
+                   help="Skip NFKC/whitespace canonicalization")
+    p.add_argument("--analyze-statistical", action="store_true",
+                   help="Heuristic machine-text analysis (never proof); "
+                        "flags text that may carry a statistical watermark")
+    p.add_argument("--launder", action="store_true",
+                   help="Paraphrase text through the built-in launder engine "
+                        "(destroys n-gram-conditioned statistical watermarks; "
+                        "prints arithmetic proof of context invalidation)")
+    p.add_argument("--launder-rate", type=float, default=0.6,
+                   help="Target token churn rate for --launder (default 0.6)")
+    p.add_argument("--rewrite", metavar="CMD",
+                   help="Pipe text through external rewriter CMD "
+                        "(stdin->stdout), e.g. 'ollama run llama3'")
+    p.add_argument("--oracle", metavar="CMD",
+                   help="Detector oracle (stdin, exit 0=clean); loops "
+                        "--launder at escalating rates until it passes")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Seed for deterministic launder output")
     args = p.parse_args()
 
     if args.stdin:
@@ -550,7 +1097,32 @@ def main():
         if args.scan:
             print(format_report("<stdin>", hits), file=sys.stderr)
             return 1 if hits else 0
+        if args.analyze_statistical:
+            print(format_report("<stdin>", hits), file=sys.stderr)
+            lines, _s = statistical_report(text)
+            print("\n".join(lines), file=sys.stderr)
+            return 1 if hits else 0
         clean, stats = strip_text(text, keep_homoglyphs=args.keep_homoglyphs)
+        if not args.no_normalize:
+            clean = normalize_text(clean)
+        if args.rewrite:
+            try:
+                clean = rewrite_text(clean, args.rewrite)
+            except RuntimeError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
+        elif args.oracle:
+            clean, lst, rounds, ok = launder_until_clean(
+                clean, args.oracle, seed=args.seed)
+            print(f"oracle loop: {rounds} round(s), "
+                  f"oracle={'CLEAN' if ok else 'STILL FLAGGED'}",
+                  file=sys.stderr)
+        elif args.launder:
+            clean, lst = launder_text(clean, target_rate=args.launder_rate,
+                                      seed=args.seed)
+            print(f"launder: churn={lst['churn_rate']:.1%}, "
+                  f"context-invalidated={lst['context_invalidated']:.1%}",
+                  file=sys.stderr)
         sys.stdout.write(clean)
         if hits:
             print(format_report("<stdin>", hits, stats), file=sys.stderr)

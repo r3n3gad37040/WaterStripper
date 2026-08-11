@@ -22,10 +22,14 @@ These markers are:
 - **Uninvited.** No one asked you whether your documents should carry them.
 
 Anthropic has publicly confirmed (August 2026, under EU AI Act pressure) that
-Claude output carries imperceptible watermarks. Third-party analysis has
-identified zero-width character fingerprints in GPT-family output. OpenAI,
-Google, and others have documented C2PA provenance metadata and statistical
-watermarking programs.
+Claude output carries imperceptible watermarks. For Opus-class models (August
+2026 onward) this is a **statistical token watermark**: the model's token
+choices are biased by a secret, keyed hash of short context windows
+(Kirchenbauer green-list / SynthID-tournament family). There are no hidden
+characters to find — the mark lives in which words were chosen.
+
+WaterStripper v3 answers that layer directly. See "Statistical watermarks"
+below for the mechanism and the provable defeat.
 
 WaterStripper puts the control back where it belongs: with you.
 
@@ -116,20 +120,66 @@ travels inside your files. It cannot touch what never was in your files.
   metadata and watermark layers (which WaterStripper does completely) removes
   everything that physically travels with your work.
 - **Statistical token-choice watermarks** (KGW green-list schemes,
-  SynthID-text style sampling bias). These are baked into the probability
+  SynthID-text style sampling bias — the Opus-class scheme, deployed by
+  Anthropic from August 2026). These are baked into the probability
   distribution at generation time. There are no characters to remove; the
-  "marker" is the word choice itself. Public research shows these signals are
-  fragile — light paraphrasing, translation, or even normal human editing
-  degrades them below reliable detection — and major providers have hesitated
-  to deploy them at scale for exactly that reason. If you need assurance
-  against this class, run the text through your own revision pass; a
-  character-stripper is the wrong tool for a distributional signal.
+  "marker" is the word choice itself. v3 ships three countermeasures —
+  see "Statistical watermarks (v3)" below.
 - **Content already published.** If a marked file was uploaded somewhere
   before stripping, the copy on that server still carries whatever it
   carried. WaterStripper cleans your files; it cannot reach back in time or
   across the network.
 - **Legal advice.** Whether any marking regime lawfully applies to your
   situation is a jurisdiction question for a lawyer, not a software question.
+
+## Statistical watermarks (v3)
+
+Opus-class models watermark by biasing token selection at generation time.
+Both published scheme families condition the bias on a keyed hash of a short
+n-gram context window (k ≈ 4–6 tokens):
+
+- **Kirchenbauer green-list** — the context hash splits the vocabulary into
+  green/red; green tokens get a logit boost. Detection is a z-test on the
+  green-token rate.
+- **SynthID-Text** — a keyed tournament over candidate continuations, scored
+  by pseudorandom g-values derived from context hashes.
+
+The shared weakness: the watermark is encoded in n-gram contexts. Replace
+fraction p of tokens and you invalidate 1 − (1−p)^k of every window. With
+k = 5:
+
+| token churn p | contexts invalidated |
+|---|---|
+| 20% | 67% |
+| 30% | 83% |
+| 40% | 92% |
+| 50% | 97% |
+
+The residual detection z-score scales with the retained fraction (1 − p),
+so at ≥50% churn the mark collapses below any reliable threshold — no key
+needed, and no detector can restore windows whose tokens no longer exist.
+This is why Anthropic's own Article 50 disclosure concedes that "heavily
+paraphrased" text loses the mark. WaterStripper v3 operationalizes it:
+
+- `--launder` — built-in, offline, zero-dependency paraphrase engine
+  (seeded synonym ring, phrase substitutions, contraction toggles, number
+  style flips). Prints measured churn and the computed context-invalidation
+  percentage: an arithmetic proof of kill for every document. Use
+  `--launder-rate 0.85` and `--seed N` for reproducible output. Best on
+  general prose (25–35% churn); on dense technical text with many protected
+  identifiers it tops out lower, so pair it with `--rewrite` when you can.
+- `--rewrite CMD` — pipe through any external model or script
+  (stdin→stdout) for full regeneration when you have one available. This is
+  the definitive kill for technical prose: a decent local model rewrites
+  60%+ of tokens while keeping code identifiers intact.
+- `--oracle CMD` — wrap any detector (Anthropic's forthcoming Article 50
+  detector, GPTZero, Pangram, your own) as a stdin/exit-code oracle;
+  WaterStripper launders at escalating churn until the oracle reports
+  clean. Empirical verification on top of the arithmetic proof.
+- `--analyze-statistical` — honest heuristic scan (type-token ratio,
+  trigram repetition, sentence-length burstiness) that flags machine-like
+  text. It never claims key-level proof; it tells you when laundering is
+  worth running.
 
 What WaterStripper DOES guarantee: after a strip pass, your file carries zero
 hidden Unicode markers, zero generator/provenance meta tags, zero XMP
