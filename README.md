@@ -99,6 +99,43 @@ marking regime:
 Whether Article 50 applies to you is between you and your lawyer. What it may
 not do is ride into your files uninvited.
 
+## What WaterStripper does NOT do
+
+Honesty matters more than marketing. WaterStripper removes everything that
+travels inside your files. It cannot touch what never was in your files.
+
+- **Fingerprint registries.** The Code of Practice's optional third mechanism
+  lets a provider hash your generated content and log that hash in a
+  server-side database. Later, anyone can submit your content and ask "did
+  this come from your model?" The answer comes from comparing against their
+  registry — there is no marker embedded in your file, so there is nothing
+  local to strip. If a provider runs such a registry and you used their
+  hosted model, that record exists on their infrastructure and no client-side
+  tool can erase it. The defense here is architectural: run local models, or
+  edit output enough that perceptual hashes no longer match. Stripping the
+  metadata and watermark layers (which WaterStripper does completely) removes
+  everything that physically travels with your work.
+- **Statistical token-choice watermarks** (KGW green-list schemes,
+  SynthID-text style sampling bias). These are baked into the probability
+  distribution at generation time. There are no characters to remove; the
+  "marker" is the word choice itself. Public research shows these signals are
+  fragile — light paraphrasing, translation, or even normal human editing
+  degrades them below reliable detection — and major providers have hesitated
+  to deploy them at scale for exactly that reason. If you need assurance
+  against this class, run the text through your own revision pass; a
+  character-stripper is the wrong tool for a distributional signal.
+- **Content already published.** If a marked file was uploaded somewhere
+  before stripping, the copy on that server still carries whatever it
+  carried. WaterStripper cleans your files; it cannot reach back in time or
+  across the network.
+- **Legal advice.** Whether any marking regime lawfully applies to your
+  situation is a jurisdiction question for a lawyer, not a software question.
+
+What WaterStripper DOES guarantee: after a strip pass, your file carries zero
+hidden Unicode markers, zero generator/provenance meta tags, zero XMP
+packets, zero C2PA manifests, and zero EU icon references — and the scan
+mode proves it byte by byte.
+
 ## Installation
 
 Requires Python 3.7+. No dependencies, no packages, no build step. One file.
